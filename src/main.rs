@@ -633,7 +633,7 @@ fn main() {
     println!("QSO Throughput Loss (relative to existing SuperFox protocol): {:.2}%",  (1_f64 - frac_rrr_messages_per_interval) * 100_f64);
     println!();
 
-    println!("Cumulative percentage of receivers that have received at least one CQ message:");
+    println!("Cumulative percentage of hounds that have received at least one CQ message:");
     println!("-----------------------------------------------------------------------------");
     for k in 1..=10 {
         let cumulative_prob = 1.0 - f64::powi(p_loss as f64, k);
