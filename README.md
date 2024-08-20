@@ -25,15 +25,37 @@ Usage: sfsig [OPTIONS]
 
 Options:
   -p, --p-loss <P_LOSS>
-          Probability of a Hound failing to decode a message sent by the Fox [default: 0.2]
+          Probability of a Hound failing to decode a message sent by the Fox
+
+          [default: 0.2]
+
   -c, --callsign <CALLSIGN>
-          Callsign of the Fox station [default: N5J]
+          Callsign of the Fox station
+
+          [default: N5J]
+
   -n, --num-periods-to-simulate <NUM_PERIODS_TO_SIMULATE>
-          Number of 15 second time periods to simulate [default: 90]
+          Number of 15 second time periods to simulate
+
+          [default: 90]
+
   -n, --num-final-cq-messages <NUM_FINAL_CQ_MESSAGES>
-          Number of CQ messages a Fox should send at the end of a session [default: 3]
+          Number of CQ messages a Fox should send at the end of a session
+
+          In the presence of message loss, sending multiple "CQ"'s at the end increases the chance for all hounds -- especially the last ones before the station signs off -- to get the data needed to validate.
+
+          [default: 3]
+
+  -m, --minutes-between-cq <MINUTES_BETWEEN_CQ>
+          Minutes between each "CQ" message.
+
+          The longer this parameter, the longer the average wait between a hound receiving an RRR & being able to validate it.
+
+          [default: 5]
+
   -h, --help
-          Print help
+          Print help (see a summary with '-h')
+
   -V, --version
           Print version
 ```

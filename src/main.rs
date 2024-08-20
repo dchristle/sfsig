@@ -39,14 +39,17 @@ struct Cli {
     /// Number of CQ messages a Fox should send at the end of a session
     ///
     /// In the presence of message loss, sending multiple "CQ"'s at the end increases the chance
-    /// for all hounds -- especially the last ones before the station signs off -- can validate
-    /// using only data received over the radio.
-    ///
-    /// Publishing the latest "CQ" message over the internet, either in real time, or once after the
-    /// DXpedition finishes, would give an additional way to validate all QSOs made with a
-    /// particular seed prior to that CQ message's timestamp.
+    /// for all hounds -- especially the last ones before the station signs off -- to get the
+    /// data needed to validate.
     #[arg(short, long, default_value_t = 3)]
     num_final_cq_messages: usize,
+
+    /// Minutes between each "CQ" message.
+    ///
+    /// The longer this parameter, the longer the average wait between a hound receiving an RRR &
+    /// being able to validate it.
+    #[arg(short, long, default_value_t = 5)]
+    minutes_between_cq: usize,
 }
 
 
@@ -58,6 +61,7 @@ fn main() {
     let callsign = cli.callsign;
     let num_periods_to_simulate = cli.num_periods_to_simulate;
     let num_final_cq_messages = cli.num_final_cq_messages;
+    let minutes_between_cq = cli.minutes_between_cq;
 
     // Your existing code here, using these variables instead of hardcoded values
     println!("Simulation parameters:");
@@ -291,7 +295,6 @@ fn main() {
     // Print some approximate statistical calculations for how long it will take for a receiver to
     // validate a message, given the loss probability
     let p_success = 1.0 - p_loss;
-    let minutes_between_cq = 5;
     let rrr_messages_per_interval = (minutes_between_cq - 1) * 2 + 1;
     let frac_rrr_messages_per_interval = rrr_messages_per_interval as f64 / (rrr_messages_per_interval as f64 + 1_f64);
     println!();
@@ -324,21 +327,21 @@ fn main() {
         expected_time_between_rrr_and_cq_uniform += (1_f64 / rrr_messages_per_interval as f64) * time_offset_minutes
     }
 
-    for minute in (5..=60).step_by(5) {
+    for minute in (minutes_between_cq..=60).step_by(minutes_between_cq) {
         let k = minute / minutes_between_cq;
-        let cumulative_prob = 1.0 - f64::powi(p_loss as f64, k);
+        let cumulative_prob = 1.0 - f64::powi(p_loss as f64, k as i32);
         // adjusted_minute accounts for a uniform probability of where in the interval between
         // CQ messages a hound receives an RRR message from the fox, i.e. an average of ~2.5 minutes
         // for a 5-minute interval between CQ's.
-        let adjusted_minute = minute as f64 - 5_f64 + expected_time_between_rrr_and_cq_uniform;
+        let adjusted_minute = minute as f64 - (minutes_between_cq as f64) + expected_time_between_rrr_and_cq_uniform;
         println!("By {} minutes: {:.2}%", adjusted_minute, cumulative_prob * 100.0);
     }
     println!();
 
-    let expected_time = minutes_between_cq as f64 / p_success as f64 - 5_f64 + expected_time_between_rrr_and_cq_uniform;
+    let expected_time = minutes_between_cq as f64 / p_success as f64 - (minutes_between_cq as f64) + expected_time_between_rrr_and_cq_uniform;
     println!("Expected time (geometric distribution) to receive first CQ message: {:.2} minutes", expected_time);
 
-    let confidence_interval_95 = minutes_between_cq as f64 * f64::ceil(f64::log(0.05, 10.0) / f64::log(p_loss as f64, 10.0)) - 5_f64 + expected_time_between_rrr_and_cq_uniform;
+    let confidence_interval_95 = minutes_between_cq as f64 * f64::ceil(f64::log(0.05, 10.0) / f64::log(p_loss as f64, 10.0)) - (minutes_between_cq as f64) + expected_time_between_rrr_and_cq_uniform;
     println!("Expected delay after which at least 95% of hounds will receive a CQ message: {:.2} minutes", confidence_interval_95);
 }
 
@@ -450,7 +453,7 @@ fn pad_and_encode_message(message: &str) -> [u8; 13] {
 ///
 /// ```
 /// use bitvec::prelude::*;
-/// use ark_bls12_381::Fr as ScalarField;
+/// use ark_bn254::Fr as ScalarField;
 ///
 /// let message = bitvec![u8, Msb0; 1, 0, 1, 1, 0, 0, 1];
 /// let private_key = ScalarField::rand(&mut rng);
