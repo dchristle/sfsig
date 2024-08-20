@@ -3,6 +3,14 @@ name = "sfsig"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "sfsig"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sfsig"
+path = "src/main.rs"
+
 [dependencies]
 ark-bls12-381 = "0.4.0"
 ark-ec = { version = "0.4.2", features = ["std"] }

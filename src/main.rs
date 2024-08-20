@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
-use std::fmt;
-use std::ops::{Bound, Mul};
+use sfsig::superfox_csprng::SuperfoxCsprng;
+use sfsig::messages::{CQMessage, RRRMessage, RadioMessage, CALLSIGN_MAX_BYTES};
+
+use std::ops::Mul;
 use std::string::ToString;
-use std::time::Instant;
 use ark_bn254::{Bn254, G1Affine, G2Affine, Fr as ScalarField};
 use ark_bn254::g2::Config;
 use ark_ec::{AffineRepr, CurveGroup};
@@ -15,343 +15,11 @@ use ark_serialize;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use bitvec::prelude::*;
 
-
 use blake3;
 use chrono::{DateTime, Timelike, Utc, Duration, Datelike, TimeZone};
 use clap::Parser;
 use rand::Rng;
 
-const CALLSIGN_MAX_BYTES: usize = 13;
-const CALLSIGN_ALLOWED_CHARS: &str = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
-
-// Must be at least 8 + 13 + 9 bytes for the state + callsign + timestamp, respectively
-const INTERNAL_HASH_INPUT_SIZE_BYTES: usize = 32;
-const MAX_CACHE_SIZE: usize = 2 * 1024 * 1024 * 8 / 64;
-
-#[allow(dead_code)]
-struct SuperfoxCsprng {
-    seed: u64,
-    csprng_epoch: DateTime<Utc>,
-    callsign: [u8; CALLSIGN_MAX_BYTES],
-    cache: BTreeMap<DateTime<Utc>, u64>
-}
-
-
-impl SuperfoxCsprng {
-    fn new(seed: u64, callsign: &str, csprng_epoch: &DateTime<Utc>) -> Result<Self, String> {
-        // Process callsign similar to ihashcall
-        if callsign.len() > CALLSIGN_MAX_BYTES {
-            return Err(format!("Callsign must be no longer than {} characters", CALLSIGN_MAX_BYTES));
-        }
-        let callsign = callsign.to_uppercase();
-        let padded_call = format!("{:13}", callsign); // Right-pad with spaces to 13 chars
-        if !padded_call.chars().all(|c| CALLSIGN_ALLOWED_CHARS.find(c).is_some() ) {
-            return Err("Callsign must only use allowed characters".to_string());
-        }
-
-        let validated_csprng_epoch: &DateTime<Utc> = Self::validate_15_second_interval(csprng_epoch)?;
-
-        let padded_callsign_bytes = Self::generate_padded_callsign_bytes(callsign);
-
-        // Create a cache-like data structure to support efficient hash lookup with bounded memory
-        let mut cache: BTreeMap<DateTime<Utc>, u64> = BTreeMap::new();
-
-        let now_utc = Utc::now();
-        let floored_now_utc = Self::floor_to_15_seconds(&now_utc);
-        let total_duration = validated_csprng_epoch.signed_duration_since(floored_now_utc);
-        let total_intervals = (total_duration.num_seconds() / 15) as usize;
-
-        // k is the smallest power-of-two to keep the # of cached hashes fewer than MAX_CACHE_SIZE
-        let k = (total_intervals as f64 / MAX_CACHE_SIZE as f64).log2().ceil() as u32;
-        let cache_interval = 2_u64.pow(k);
-        let est_total_cached_values = total_intervals as u64/cache_interval;
-        println!("k is {} and cache_interval is {}, implying {} cached values", k.clone(), cache_interval.clone(), est_total_cached_values);
-
-        let measure_timing_start = Instant::now();
-
-        let mut current_state: u64 = seed;
-        let mut current_time = validated_csprng_epoch.clone();
-        println!("Validated epoch is {}, start time is {}", current_time.clone(), floored_now_utc.clone());
-        println!("Populating cache...");
-
-        // Compute CSPRNG outputs for all 15-second intervals between now & csprng_epoch
-        //
-        // A small change would make it possible to store only a fraction of these CSPRNG states
-        let mut count = 0;
-        while current_time > floored_now_utc {  // Changed condition here
-            match Self::next(current_state, &padded_callsign_bytes, &current_time) {
-                Ok(hash) => {
-                    // Uncomment this to store only a fraction of CSPRNG states (currently bugged)
-                    // if count % cache_interval == 0 {
-                    //     cache.insert(current_time, hash);
-                    // }
-                    cache.insert(current_time, hash);
-                    current_state = hash; // Use current hash output as state input to next iteration
-                    count += 1;
-                },
-                Err(e) => {
-                    println!("Error occurred at current_time {}: {}", current_time, e);
-                    break;
-                }
-            }
-            current_time -= Duration::seconds(15);
-        }
-
-        println!("Finished computing {} hash values and caching {} entries in {} seconds.",
-                 count, cache.len(), measure_timing_start.elapsed().as_secs_f32());
-
-        Ok(SuperfoxCsprng {
-            seed,
-            csprng_epoch: *validated_csprng_epoch,
-            callsign: padded_callsign_bytes,
-            cache: cache
-        })
-    }
-
-    fn generate_padded_callsign_bytes(callsign: String) -> [u8; 13] {
-        let mut padded_callsign_bytes: [u8; CALLSIGN_MAX_BYTES] = [0u8; CALLSIGN_MAX_BYTES];
-        for (i, &byte) in callsign.as_bytes().iter().take(CALLSIGN_MAX_BYTES).enumerate() {
-            padded_callsign_bytes[i] = byte;
-        }
-        padded_callsign_bytes
-    }
-
-    fn floor_to_15_seconds(time: &DateTime<Utc>) -> DateTime<Utc> {
-        if time.second() % 15 == 0 && time.nanosecond() == 0 {
-            return time.clone();
-        }
-
-        // Create a copy floored to the minute
-        let floored_to_minute = time
-            .with_second(0)
-            .unwrap()
-            .with_nanosecond(0)
-            .unwrap();
-
-        let seconds_diff = time.signed_duration_since(floored_to_minute).num_seconds();
-        let intervals = (seconds_diff as u32) / 15;
-        floored_to_minute + Duration::seconds((intervals * 15) as i64)
-    }
-
-    fn validate_15_second_interval(time: &DateTime<Utc>) -> Result<&DateTime<Utc>, String> {
-        match time.second() {
-            0 | 15 | 30 | 45 => Ok(time),
-            _ => Err("Time must be at a 15-second interval".to_string()),
-        }
-    }
-
-    pub fn next(previous_state: u64, &callsign: &[u8; CALLSIGN_MAX_BYTES], current_time: &DateTime<Utc>) -> Result<u64, String> {
-        let valid_time = Self::validate_15_second_interval(&current_time)?;
-
-        let mut input = [0u8; INTERNAL_HASH_INPUT_SIZE_BYTES];
-
-        // Populate input array
-        input[0..8].copy_from_slice(&previous_state.to_be_bytes());
-        input[8..21].copy_from_slice(&callsign);
-        input[21..25].copy_from_slice(&valid_time.year().to_be_bytes());
-        input[25..26].copy_from_slice(&[valid_time.month() as u8]);
-        input[26..27].copy_from_slice(&[valid_time.day() as u8]);
-        input[28..29].copy_from_slice(&[valid_time.hour() as u8]);
-        input[29..30].copy_from_slice(&[valid_time.minute() as u8]);
-        input[30..31].copy_from_slice(&[valid_time.second() as u8]);
-
-        let hash = blake3::hash(&input);
-        let new_state = u64::from_be_bytes(hash.as_bytes()[0..8].try_into().unwrap());
-        let xor_bits = u64::from_be_bytes(hash.as_bytes()[8..16].try_into().unwrap());
-
-        Ok(new_state ^ xor_bits)
-    }
-
-    pub fn advance_multiple_steps(initial_state: u64, steps: u64, callsign: &[u8; CALLSIGN_MAX_BYTES], end_time: &DateTime<Utc>) -> Result<u64, String> {
-        let mut current_state = initial_state;
-        let mut current_time = *end_time;
-
-        for _ in 0..steps {
-            current_time = current_time - Duration::seconds(15);
-            current_state = Self::next(current_state, callsign, &current_time)?;
-        }
-
-        Ok(current_state)
-    }
-
-    // pub fn get_rand(&self, current_time: &DateTime<Utc>) -> Result<u64, String> {
-    //     let floored_time = Self::floor_to_15_seconds(current_time);
-    //
-    //     if floored_time > self.csprng_epoch {
-    //         return Err("Cannot generate values for times after the CSPRNG epoch".to_string());
-    //     }
-    //
-    //     // Find the nearest future cached time
-    //     let (cached_time, cached_state) = self.cache
-    //         .range(floored_time..)
-    //         .next()
-    //         .ok_or("No suitable cached value found")?;
-    //
-    //     let mut current_state = *cached_state;
-    //     let mut current_it_time = *cached_time;
-    //
-    //     // Compute hashes from the cached time to the desired time
-    //     while current_it_time > floored_time {
-    //         current_it_time -= Duration::seconds(15);
-    //         current_state = Self::next(current_state, &self.callsign, &current_it_time)?;
-    //     }
-    //
-    //     Ok(current_state)
-    // }
-    pub fn get_rand(&self, current_time: &DateTime<Utc>) -> Result<u64, String> {
-        let floored_time = Self::floor_to_15_seconds(current_time);
-
-        if floored_time > self.csprng_epoch {
-            return Err("Cannot generate values for times after the CSPRNG epoch".to_string());
-        }
-
-        // First, try to get an exact match
-        if let Some(value) = self.cache.get(&floored_time) {
-            return Ok(*value);
-        }
-        println!("get_rand did *not* find an exact match for time {}", floored_time.clone());
-
-        // If no exact match, find the nearest future cached time
-        let (cached_time, cached_state) = self.cache
-            .range((Bound::Excluded(floored_time), Bound::Unbounded))
-            .next()
-            .ok_or("No suitable cached value found")?;
-
-        let mut current_state = *cached_state;
-        let mut current_it_time = *cached_time;
-
-        // Compute hashes from the cached time to the desired time
-        while current_it_time > floored_time {
-            current_state = Self::next(current_state, &self.callsign, &current_it_time)?;
-            current_it_time -= Duration::seconds(15);
-        }
-
-        Ok(current_state)
-    }
-}
-
-
-#[derive(Debug)]
-pub struct InvalidBitVecSizeError;
-
-#[derive(Debug, Clone)]
-pub struct CQMessage {
-    callsign_and_location: BitVec<u8, Msb0>,  // 77 bits
-    csprng_state: BitVec<u8, Msb0>,           // 64 bits
-    timestamp: DateTime<Utc>,                 // 72 bits (9 bytes) when encoded
-    signature: BitVec<u8, Msb0>,              // 256-bit BLS signature
-}
-
-impl CQMessage {
-    pub fn new(timestamp: DateTime<Utc>) -> Self {
-        CQMessage {
-            callsign_and_location: BitVec::new(),
-            csprng_state: BitVec::new(),
-            timestamp,
-            signature: BitVec::new(),
-        }
-    }
-
-    pub fn set_callsign_and_location(&mut self, data: BitVec<u8, Msb0>) -> Result<(), InvalidBitVecSizeError> {
-        if data.len() == 77 {
-            self.callsign_and_location = data;
-            Ok(())
-        } else {
-            Err(InvalidBitVecSizeError)
-        }
-    }
-
-    pub fn set_csprng_state(&mut self, data: BitVec<u8, Msb0>) -> Result<(), InvalidBitVecSizeError> {
-        if data.len() == 64 {
-            self.csprng_state = data;
-            Ok(())
-        } else {
-            Err(InvalidBitVecSizeError)
-        }
-    }
-
-    pub fn set_signature(&mut self, data: BitVec<u8, Msb0>) -> Result<(), InvalidBitVecSizeError> {
-        if data.len() == 256 {
-            self.signature = data;
-            Ok(())
-        } else {
-            Err(InvalidBitVecSizeError)
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct RRRMessage {
-    payload: BitVec<u8, Msb0>,                // 300 bits, used as a placeholder for signal report & RR73 payload from fox
-    hmac: BitVec<u8, Msb0>,                   // 20-bit HMAC-like hash
-    timestamp: DateTime<Utc>,                 // 72 bits (9 bytes) - implicit in transmission time
-}
-
-impl RRRMessage {
-    pub fn new(timestamp: DateTime<Utc>) -> Self {
-        RRRMessage {
-            payload: BitVec::new(),
-            hmac: BitVec::new(),
-            timestamp,
-        }
-    }
-
-    pub fn set_payload(&mut self, data: BitVec<u8, Msb0>) -> Result<(), InvalidBitVecSizeError> {
-        if data.len() == 300 { // Ensures RRR payload is exactly 300 bits
-            self.payload = data;
-            Ok(())
-        } else {
-            Err(InvalidBitVecSizeError)
-        }
-    }
-
-    pub fn set_hmac(&mut self, data: BitVec<u8, Msb0>) -> Result<(), InvalidBitVecSizeError> {
-        if data.len() == 20 { // Ensures HMAC-like hash is exactly 20 bits
-            self.hmac = data;
-            Ok(())
-        } else {
-            Err(InvalidBitVecSizeError)
-        }
-    }
-}
-
-impl fmt::Display for RRRMessage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}: <... 300 signal report/RR73 bits ...> + {} hash (20 bits) -- (320 bits total, before FEC)",
-            self.timestamp.format("%Y-%m-%d %H:%M:%S"),
-            format_bitvec(&self.hmac)
-        )
-    }
-}
-
-impl fmt::Display for CQMessage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}: <... 77 callsign_and_location bits ...> + {} CSPRNG state (64 bits) + {} BLS signature (256 bits) -- (397 bits total, before FEC)",
-            self.timestamp.format("%Y-%m-%d %H:%M:%S"),
-            format_bitvec(&self.csprng_state),
-            format_bitvec(&self.signature)
-        )
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum RadioMessage {
-    CQ(CQMessage),
-    RRR(RRRMessage),
-}
-
-impl RadioMessage {
-    pub fn timestamp(&self) -> &DateTime<Utc> {
-        match self {
-            RadioMessage::CQ(msg) => &msg.timestamp,
-            RadioMessage::RRR(msg) => &msg.timestamp,
-        }
-    }
-}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -369,10 +37,17 @@ struct Cli {
     num_periods_to_simulate: usize,
 
     /// Number of CQ messages a Fox should send at the end of a session
+    ///
+    /// In the presence of message loss, sending multiple "CQ"'s at the end increases the chance
+    /// for all hounds -- especially the last ones before the station signs off -- can validate
+    /// using only data received over the radio.
+    ///
+    /// Publishing the latest "CQ" message over the internet, either in real time, or once after the
+    /// DXpedition finishes, would give an additional way to validate all QSOs made with a
+    /// particular seed prior to that CQ message's timestamp.
     #[arg(short, long, default_value_t = 3)]
     num_final_cq_messages: usize,
 }
-
 
 
 fn main() {
@@ -388,7 +63,7 @@ fn main() {
     println!("Simulation parameters:");
     println!("P(loss): {}", p_loss);
     println!("Callsign: {}", callsign);
-    println!("Number of periods to simulate: {} ({:.2}% minutes)", num_periods_to_simulate, (num_periods_to_simulate as f64 - 1.0)*0.25);
+    println!("Number of periods to simulate: {} ({:.2}% minutes)", num_periods_to_simulate, (num_periods_to_simulate as f64 - 1.0) * 0.25);
     println!("Number of final CQ messages: {}", num_final_cq_messages);
     println!();
 
@@ -440,7 +115,6 @@ fn main() {
     // - callsign: a string representing the DXpedition callsign
     let seed = 0x0123456789ABCDEF; // hardcoded for demo
     let csprng_epoch = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
-    let callsign = "N5J".to_string();
 
     let csprng = SuperfoxCsprng::new(seed, &callsign, &csprng_epoch).unwrap();
 
@@ -548,7 +222,7 @@ fn main() {
         if is_lost {
             // If the receiver lost the message, skip processing it
             num_messages_lost += 1;
-            continue
+            continue;
         }
 
         match message {
@@ -575,8 +249,7 @@ fn main() {
                 let is_cq_message_signature_valid = validate_bls_signature(&concatenated_message_bits, &signature_bits, &public_key_bits);
                 if is_cq_message_signature_valid {
                     println!("Found valid CQ message signature for CQ message at {}", cq_message.timestamp.clone());
-                }
-                else {
+                } else {
                     println!("Found INVALID CQ message signature for CQ message at {}", cq_message.timestamp.clone());
                 }
 
@@ -590,20 +263,19 @@ fn main() {
                     let time_to_validate = cq_message.timestamp - pending_message.timestamp;
                     if message_is_valid {
                         println!("{} -- **VALID SIGNATURE** (time-to-validate: {})", pending_message.clone(), format_duration(time_to_validate));
-                    }
-                    else {
+                    } else {
                         println!("{} -- **INVALID SIGNATURE** (time-to-validate: {})", pending_message.clone(), format_duration(time_to_validate))
                     }
                 }
                 // All pending messages processed, so clear the queue
                 pending_messages_to_validate.clear();
-            },
+            }
             RadioMessage::RRR(rrr) => {
                 // Add the RRR message to the buffer (we'd print it on the screen in WSJT-X, but perhaps later, change it's color
                 // when we later validate it)
                 pending_messages_to_validate.push(rrr.clone());
                 // println!("RRR message at {}", rrr.timestamp)
-            },
+            }
         }
     }
     // Handle messages we've received but not yet validated, since we stopped receiving before we
@@ -621,7 +293,7 @@ fn main() {
     let p_success = 1.0 - p_loss;
     let minutes_between_cq = 5;
     let rrr_messages_per_interval = (minutes_between_cq - 1) * 2 + 1;
-    let frac_rrr_messages_per_interval = rrr_messages_per_interval as f64/(rrr_messages_per_interval as f64 + 1_f64);
+    let frac_rrr_messages_per_interval = rrr_messages_per_interval as f64 / (rrr_messages_per_interval as f64 + 1_f64);
     println!();
     println!();
     println!();
@@ -630,7 +302,7 @@ fn main() {
     println!("Probability of message loss: {:.2}%", p_loss * 100.0);
     println!("Time between CQ messages: {} minutes", minutes_between_cq);
     println!("Efficiency (fraction of total messages that are RRR): {:.2}% ", frac_rrr_messages_per_interval * 100_f64);
-    println!("QSO Throughput Loss (relative to existing SuperFox protocol): {:.2}%",  (1_f64 - frac_rrr_messages_per_interval) * 100_f64);
+    println!("QSO Throughput Loss (relative to existing SuperFox protocol): {:.2}%", (1_f64 - frac_rrr_messages_per_interval) * 100_f64);
     println!();
 
     println!("Cumulative percentage of hounds that have received at least one CQ message:");
@@ -648,8 +320,8 @@ fn main() {
     // CQs, and calculate the expectation time to the 1st CQ
     let mut expected_time_between_rrr_and_cq_uniform = 0_f64;
     for i in 0..rrr_messages_per_interval {
-        let time_offset_minutes =  (i as f64 + 1_f64) * 30_f64/60_f64;
-        expected_time_between_rrr_and_cq_uniform += (1_f64/rrr_messages_per_interval as f64) * time_offset_minutes
+        let time_offset_minutes = (i as f64 + 1_f64) * 30_f64 / 60_f64;
+        expected_time_between_rrr_and_cq_uniform += (1_f64 / rrr_messages_per_interval as f64) * time_offset_minutes
     }
 
     for minute in (5..=60).step_by(5) {
@@ -668,7 +340,6 @@ fn main() {
 
     let confidence_interval_95 = minutes_between_cq as f64 * f64::ceil(f64::log(0.05, 10.0) / f64::log(p_loss as f64, 10.0)) - 5_f64 + expected_time_between_rrr_and_cq_uniform;
     println!("Expected delay after which at least 95% of hounds will receive a CQ message: {:.2} minutes", confidence_interval_95);
-
 }
 
 fn hash_rrr_payload(rrr_payload: BitVec<u8, Msb0>, csprng_state_bits: &BitVec<u8, Msb0>, timestamp_bits: &BitVec<u8, Msb0>) -> BitVec<u8, Msb0> {
@@ -693,31 +364,6 @@ fn pack80(message_bytes: &[u8; 13]) -> [u8; 10] {
     result
 }
 
-
-/// Formats a BitVec into a string of '0's and '1's.
-///
-/// This function takes a reference to any BitVec and returns a String
-/// representation of its bits, with '0' for unset bits and '1' for set bits.
-///
-/// # Arguments
-///
-/// * `bits` - A reference to a BitVec to be formatted.
-///
-/// # Returns
-///
-/// A String containing '0's and '1's representing the input BitVec.
-///
-/// # Examples
-///
-/// ```
-/// use bitvec::prelude::*;
-///
-/// let bv = bitvec![u8, Msb0; 1, 0, 1, 1, 0];
-/// assert_eq!(format_bitvec(&bv), "10110");
-/// ```
-pub fn format_bitvec<T: BitStore>(bits: &BitVec<T, Msb0>) -> String {
-    bits.iter().map(|b| if *b { '1' } else { '0' }).collect()
-}
 
 /// Converts a byte slice to a BitVec with a specific number of bits.
 ///
@@ -985,47 +631,3 @@ fn format_duration(duration: Duration) -> String {
         format!("{}s", seconds)
     }
 }
-
-// use ark_bls12_381::{Fr as ScalarField, G1Affine, G1Projective, Bls12_381};
-// use ark_ec::{AffineRepr, CurveGroup, pairing::Pairing};
-// use ark_ff::{BigInteger, Field, PrimeField};
-// use ark_std::UniformRand;
-// use sha2::{Digest, Sha256};
-//
-// fn main() {
-//     let mut rng = ark_std::rand::thread_rng();
-//
-//     // Generate private key
-//     let private_key: ScalarField = ScalarField::rand(&mut rng);
-//
-//     // Compute public key
-//     let public_key = G1Affine::generator().mul_bigint(private_key).into_affine();
-//
-//     // Message to sign
-//     let message = b"Hello, world!";
-//
-//     // Hash the message (in a real implementation, you'd use a hash-to-curve function)
-//     let hashed_message = hash_message(message);
-//
-//     // Sign the message
-//     let signature = G1Affine::generator().mul_bigint(private_key * hashed_message).into_affine();
-//
-//     println!("Private key: 0x{}", hex::encode(private_key.into_bigint().to_bytes_le()));
-//     println!("Public key: 0x{}", hex::encode(public_key.to_compressed()));
-//     println!("Message: {:?}", std::str::from_utf8(message).unwrap());
-//     println!("Signature: 0x{}", hex::encode(signature.to_compressed()));
-//
-//     // Verify the signature
-//     let g2_gen = ark_bls12_381::G2Affine::generator();
-//     let lhs = Bls12_381::pairing(signature, g2_gen);
-//     let rhs = Bls12_381::pairing(public_key, g2_gen.mul(hashed_message).into_affine());
-//
-//     println!("Signature valid: {}", lhs == rhs);
-// }
-//
-// fn hash_message(message: &[u8]) -> ScalarField {
-//     let mut hasher = Sha256::new();
-//     hasher.update(message);
-//     let result = hasher.finalize();
-//     ScalarField::from_le_bytes_mod_order(&result)
-// }
