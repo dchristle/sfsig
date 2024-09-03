@@ -60,8 +60,8 @@ The SuperFox protocol uses the IV3NWV Q-ary Polar Code with parameters (n,k) = (
 
 1. BLS Digital Signatures
 2. Cryptographically Secure Pseudorandom Number Generator (CSPRNG)
-3. Special CQ Messages
-4. RRR Messages (containing signal reports & RR73's)
+3. New "Authentication Signature" messages (formerly known as "Special CQ messages")
+4. RRR Messages (containing signal reports & RR73 acknowledgements)
 
 ### 3.3 BTO Protocol Overview
 
