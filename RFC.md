@@ -8,7 +8,17 @@ The BTO Protocol is designed to augment the "SuperFox" mode of the FT8 amateur r
 
 So-called "pirate" stations are motivated to impersonate authentic "DXpedition" stations. There is no intrinsic mechanism within amateur radio to prevent one station from using any callsign, so impersonation is trivial. Besides impersonation, pirates may also be motivated to interfere with a legitimate DXpedition station.
 
-This protocol aims to provide a secure and efficient method for authenticating messages in DXpedition scenarios, where high-volume, low-bandwidth communications are critical.
+Embedding the BTO protocol within SuperFox will serve several practice anti-abuse aims:
+
+- Hound stations see a high-security authenticity check of their QSO within a few minutes
+  - Without requiring a continuous Internet connection on the Hound nor the Fox side.
+  - ~3.75 minutes @ 20% message loss probability
+- Authenticated QSOs serve as a deterrent for pirates interfering with a DXpedition
+  - The BTO protocol authenticates both RRR signal report/acknowledgement and Authentication Signature messages sent periodically (~5 minutes).
+  - Even if some Hounds cannot authenticate due to low signal/high message loss, Hounds that do decode will clearly see any inauthentic activity.
+  - Besides not logging the inauthentic QSOs, alerting others of the presence of the pirate will reduce the pirate's success further.
+  - With lower success rates, pirates may give up all together.
+  
 
 
 ## 2. Goals and Non-Goals
@@ -95,8 +105,6 @@ The SuperFox protocol uses the IV3NWV Q-ary Polar Code with parameters (n,k) = (
     - The revealed CSPRNG state allows verification of previous messages
 
 ![image](https://github.com/user-attachments/assets/966b9a6f-4177-4b27-b8b5-4799bbc26ef1)
-
-
 
 ### 3.4 CSPRNG Design and Security Considerations
 
@@ -208,20 +216,22 @@ The Cryptographically Secure Pseudorandom Number Generator (CSPRNG) is a corners
 
 The choice of the elliptic curve for BLS signatures is crucial:
 
-1. Signature Size: BLS signatures typically have a size approximately twice the security level in bits. The prototype Rust code uses the BN254 curve to demonstrate the mechanics of the BTO protocol. But the 256-bit signatures produced by this curve are slightly too large. We aim for a 200-bit signature to fit within the message constraints.
+1. Signature Size: BLS signatures typically have a size approximately twice the security level in bits. The prototype Rust code uses the BN254 curve to demonstrate the mechanics of the BTO protocol. The 256-bit signatures produced by this curve are slightly too large, however. We aim for a 200-bit signature to fit within the message constraints.
 
 2. Security Level: The chosen curve should provide approximately 80-90 bits of security, balancing security requirements with signature/message size constraints.
 
 3. Curve Selection: Further work is needed to identify the most appropriate elliptic curve that meets these requirements. We will likely use an existing parameterized family of curves or some other generation method from the literature.
 
 ### 3.6 Message Structure
-**Standard message (i3 = 0):** Contains FoxCall, up to 9 HoundCalls, up to 4 signal reports, "MoreCQs" flag, a 20-bit digital signature, and a 3-bit message type.
+**Standard RRR message (i3 = 0):** Contains FoxCall, up to 9 HoundCalls, up to 4 signal reports, "MoreCQs" flag, a 20-bit digital signature, and a 3-bit message type.
 ```
 F   H1  H2  H3  H4  H5  H6  H7  H8  H9  R6 R7 R8 R9 U  Q  D   M    Type
 c28 c28 c28 c28 c28 c28 c28 c28 c28 c28 r5 r5 r5 r5 u5 q1 d20 i3=0 Std Msg
 280 300 305 326 329
 ```
-This message type already exists in the prototype SuperFox protocol. In the prototype, the 20-bit digital signature is based on a pre-shared secret corresponding to the DXpedition's callsign. In the BTO protocol, we
+This message type already exists in the prototype SuperFox protocol. It contains signal reports & acknowledgments (RRR/RR73) to various Hound stations within a single transmission. In the prototype, the 20-bit digital signature is based on a pre-shared secret corresponding to the DXpedition's callsign. 
+
+In the BTO protocol, we re-purpose these 20 bits to be a hash of the message data, callsign, timestamp, and the internal state of an RNG. Anyone with the hash inputs can recompute the hash & compare it to the transmitted 20-bit value. The RNG state is known only to the Fox at the time of transmission. Later, the Authentication Signature messages (described below) reveal RNG state bits that can be used to reconstruct the RNG state used in the Standard RRR message type & hence validate its authenticity.
 
 
 **Authentication Signature message w/ standard call (i3 = 4):** Contains standard 28-bit FoxCall, 15-bit grid locator, 56-bit RNG state, and approximately 185-bit BLS signature. The remaining ~45 bits are unused.
@@ -261,13 +271,13 @@ The two authentication signature message types (i3 = 4 and i3 = 5) are new. A co
 
 ### 3.7 Validation Process
 
-1. Hounds store received messages (both CQ and RRR) in a pending queue.
-2. Upon receiving a CQ message:
+1. Received messages are shown in the Hound's WSJTX UI. RRR message types are stored internally in a pending queue.
+2. Upon receiving an Authenticated Signature message:
     - Verify the BLS signature using the Fox's public key
     - Extract the CSPRNG state
     - Use the CSPRNG state to validate all pending RRR messages by recomputing and comparing the 20-bit hashes
-3. Validated messages are moved from the pending queue to a validated message list
-4. Messages that fail validation are discarded or flagged as potentially fraudulent in the UI
+3. Validated messages are removed from the pending queue, and the UI is updated to indicate the RRR message is valid
+4. Messages that fail validation are also removed from the pending queue & flagged as potentially fraudulent in the UI
 
 ## 4. Code and Pseudo-code
 
@@ -276,26 +286,33 @@ The two authentication signature message types (i3 = 4 and i3 = 5) are new. A co
 ## 5. Alternatives Considered
 
 1. Fixed set of pre-generated keys
-    - Pro: Keys can be "baked in" to software
-    - Con: Lacks flexibility and requires periodic updates
+    - Pro: Keys can be "baked in" to software without the need for Internet-based updates
+    - Con: Lacks flexibility and still requires periodic updates, for various reasons, which must be done via requiring users to download a software update
 
 2. Per-message digital signatures
     - Pro: Very high security
-    - Pro: No impact from message loss, since the same signal report/acknoledgement message contains the digital signature
-    - Con: Reduces QSO efficiency. If the signature is ~185-bits, that leaves only 144 bits for signal reports/acknowledgements out of the 329-bit total in a standard message.
+    - Pro: No impact from message loss, since the same signal report/acknowledgement message contains the digital signature
+    - Con: Reduces QSO efficiency. If the signature is ~185-bits, that leaves only 144 bits for signal reports/acknowledgements out of the 329-bit total in a standard message. Using a much smaller signature in an attempt to mitigate efficiency loss risks making the signatures too easy to forge, defeating the purpose.
 
 ## 6. Cross-cutting Concerns
 
 ### 6.1 Security
 
-- The BN254 curve provides ~100 bits of security, but is slightly too large, so we need to find a smaller curve
+- The BN254 curve provides ~100 bits of security, but is slightly too large, so we need to find a smaller curve. There are several parameterized curve families
 - 20-bit hash per RRR message maintains low overhead while providing adequate security
 
 ### 6.2 Performance
 
-- Expected time for a Hound to verify: 3.75 minutes (at 20% message loss)
+- Any Authenticated Signature message transmitted after an RRR message can be used to validate the RRR message.
+- This implies the expected time `t` for a Hound to verify with message loss probability `p` and Authentication Signature transmission period `T` follows a geometric distribution:
+  - `E(t) = T/2 + (T/(1-p) - T) = T/2 + pT/(1-p)`
+- Expected time for a Hound to verify at `T = 5 minutes`: 
+   - 3.75 minutes @ 20% message loss
+   - 5.83 minutes @ 40% message loss
+   - 22.5 minutes @ 80% message loss
+   - 47.5 minutes @ 90% message loss
 - 95% chance of validation within 7.5 minutes (at 20% message loss)
-- QSO throughput efficiency: ~90% (assuming 5-minute intervals for special authenticated state messages)
+- QSO throughput efficiency: ~90% for `T = 5 minutes`, 95% for `T = 10 minutes` 
 
 ### 6.3 Compatibility
 
@@ -415,8 +432,8 @@ The BTO protocol requires efficient and secure distribution of DXpedition public
 #### 6.4.5 Security Considerations
 
 1. Root Key Protection:
-   - WSJT-X developer and NCDXF root keys must be kept extremely secure.
-   - In the basic scheme where we bake these in, a software update would be required to update them.
+   - WSJT-X developer and NCDXF root keys must be kept extremely secure. We bake these keys into the WSJTX client software & they're used to sign DXpedition-specific keys. Anyone with access to these keys can thus create "authentic" DXpedition keypairs. As a matter of good hygeine, we should have an expiration of these keys & rotate them every ~2 years.
+   - In the basic scheme where we bake these in, a software update would be required to update them. We could consider delivering key updates via the GitHub repository, similar to DXpedition-specific keys.
 
 2. DXpedition Key Security/Verification
    - We only require that DXpeditions send us their public key, which we sign with the WSJT-X developer and NCDXF root keys.

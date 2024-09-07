@@ -3,17 +3,21 @@ use sfsig::messages::{CQMessage, RRRMessage, RadioMessage, CALLSIGN_MAX_BYTES};
 
 use std::ops::Mul;
 use std::string::ToString;
-use ark_bn254::{Bn254, G1Affine, G2Affine, Fr as ScalarField};
+use ark_bn254::{Bn254, G1Affine, G2Affine, Fr as ScalarField, Fq12};
 use ark_bn254::g2::Config;
 use ark_ec::{AffineRepr, CurveGroup};
+use ark_ec::bn::Bn;
 use ark_ec::pairing::Pairing;
 use ark_ec::short_weierstrass::Affine;
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::{BigInteger, Field, PrimeField};
 use ark_std::UniformRand;
 use sha2::{Digest, Sha256};
 use ark_serialize;
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use bitvec::prelude::*;
+use num_bigint::{BigUint, RandBigInt};
+use num_traits::{One, Zero};
+use num_integer::Integer;
 
 use blake3;
 use chrono::{DateTime, Timelike, Utc, Duration, Datelike, TimeZone};
@@ -67,12 +71,63 @@ fn main() {
     println!("Simulation parameters:");
     println!("P(loss): {}", p_loss);
     println!("Callsign: {}", callsign);
-    println!("Number of periods to simulate: {} ({:.2}% minutes)", num_periods_to_simulate, (num_periods_to_simulate as f64 - 1.0) * 0.25);
+    println!("Number of periods to simulate: {} ({:.2} minutes)", num_periods_to_simulate, (num_periods_to_simulate as f64 - 1.0) * 0.25);
     println!("Number of final CQ messages: {}", num_final_cq_messages);
     println!();
 
 
     let mut rng = rand::thread_rng();
+
+    // // Target field size of ~180 bits
+    // let target_bits = 180;
+    //
+    // let mut ii = 0;
+    // loop {
+    //     ii += 1;
+    //     // Generate a random z of about 15 bits (2^14 <= z < 2^15)
+    //     let z: BigUint = rng.gen_biguint_range(&(BigUint::one() << 30), &(BigUint::one() << 31));
+    //
+    //
+    //     let p = bls12_p(&z);
+    //     let r = bls12_r(&z);
+    //
+    //     let enough_bits = p.bits() >= target_bits;
+    //     let p_probably_prime = is_probably_prime(&p, 10);
+    //     let r_probably_prime = is_probably_prime(&r, 10);
+    //
+    //     if ii % 100000 == 0 {
+    //         println!("Iteration {ii} -- enough bits: {} ({}) p_prime: {} r_prime: {}", enough_bits, p.bits(), p_probably_prime, r_probably_prime);
+    //     }
+    //
+    //     if enough_bits && p_probably_prime && r_probably_prime {
+    //         println!("Found suitable parameters:");
+    //         println!("z = {}", z);
+    //         println!("p = {} ({} bits)", p, p.bits());
+    //         println!("r = {} ({} bits)", r, r.bits());
+    //
+    //         // Embedding degree is fixed at 12 for BLS12 curves
+    //         println!("Embedding degree k = 12");
+    //
+    //         // Generate a simple curve equation y^2 = x^3 + b
+    //         let b: u32 = rng.gen_range(1..=20);  // Small random b
+    //         println!("Curve equation: y^2 = x^3 + {}", b);
+    //
+    //         // Find a quadratic non-residue in Fp
+    //         let non_residue = find_quadratic_non_residue(&p);
+    //         println!("Quadratic non-residue in Fp: {}", non_residue);
+    //
+    //         // Find a cubic non-residue in Fp2
+    //         let (a0, a1) = find_cubic_non_residue(&p, &non_residue);
+    //         println!("Cubic non-residue in Fp2: {} + {}√{}", a0, a1, non_residue);
+    //
+    //         // Generate the twist
+    //         let twist_b = (BigUint::from(b) * &non_residue.modpow(&BigUint::from(3u32), &p)) % &p;
+    //         println!("Twisted curve equation: y^2 = x^3 + {}ξ", twist_b);
+    //         println!("Where ξ = {} + {}√{}", a0, a1, non_residue);
+    //
+    //         break;
+    //     }
+    // }
 
     // Generate private key
     let private_key: ScalarField = ScalarField::rand(&mut rng);
@@ -634,3 +689,158 @@ fn format_duration(duration: Duration) -> String {
         format!("{}s", seconds)
     }
 }
+
+// BLS12 curve parameters
+fn bls12_p(z: &BigUint) -> BigUint {
+    let one = BigUint::one();
+    let three = BigUint::from(3u32);
+    (z - &one).pow(2u32) * (z.pow(4u32) - z.pow(2u32) + &one) / &three + z
+}
+
+fn bls12_r(z: &BigUint) -> BigUint {
+    z.pow(4u32) - z.pow(2u32) + BigUint::one()
+}
+
+// Perform a single iteration of Miller-Rabin test
+fn miller_rabin_test(n: &BigUint, a: &BigUint) -> bool {
+    if n <= &BigUint::from(3u32) {
+        return n > &BigUint::one();
+    }
+
+    if n.is_even() {
+        return false;
+    }
+
+    let one: BigUint = One::one();
+    let two: BigUint = BigUint::from(2u32);
+
+    // Write n - 1 as 2^s * d
+    let mut s = 0;
+    let mut d = n - &one;
+    while (&d).is_even() {
+        s += 1;
+        d /= &two;
+    }
+
+    let mut x = a.modpow(&d, n);
+    if x == one || x == n - &one {
+        return true;
+    }
+
+    for _ in 1..s {
+        x = (&x * &x) % n;
+        if x == n - &one {
+            return true;
+        }
+        if x == one {
+            return false;
+        }
+    }
+
+    false
+}
+
+// Perform multiple iterations of Miller-Rabin test
+fn is_probably_prime(n: &BigUint, iterations: u32) -> bool {
+    if n <= &BigUint::from(3u32) {
+        return n > &BigUint::one();
+    }
+
+    let mut rng = rand::thread_rng();
+
+    for _ in 0..iterations {
+        let a = rng.gen_biguint_range(&BigUint::from(2u32), n);
+        if !miller_rabin_test(n, &a) {
+            return false;
+        }
+    }
+
+    true
+}
+
+
+// Function to find a quadratic non-residue in Fp
+fn find_quadratic_non_residue(p: &BigUint) -> BigUint {
+    let mut rng = rand::thread_rng();
+    let p_minus_one = p - BigUint::one();
+    let exponent = &p_minus_one / 2u32;
+
+    loop {
+        let a = rng.gen_biguint_range(&BigUint::from(2u32), p);
+        if a.modpow(&exponent, p) != BigUint::one() {
+            return a;
+        }
+    }
+}
+
+// Function to find a cubic non-residue in Fp2
+fn find_cubic_non_residue(p: &BigUint, non_residue: &BigUint) -> (BigUint, BigUint) {
+    let mut rng = rand::thread_rng();
+    let p_squared = p * p;
+    let exponent = (&p_squared - BigUint::one()) / 3u32;
+
+    loop {
+        let a0 = rng.gen_biguint_range(&BigUint::zero(), p);
+        let a1 = rng.gen_biguint_range(&BigUint::zero(), p);
+
+        // Check if (a0 + a1 * √non_residue)^((p^2-1)/3) != 1 in Fp2
+        let norm = (&a0 * &a0 + non_residue * &a1 * &a1) % p;
+        if norm.modpow(&exponent, p) != BigUint::one() {
+            return (a0, a1);
+        }
+    }
+}
+//
+//
+//
+// use algebra::{
+//     bn::{Bn, G1Affine, G2Affine, Fq12},
+//     fields::Field,
+//     curves::ProjectiveCurve,
+//     PairingEngine,
+// };
+// struct BnOptimalAtePairing;
+//
+// impl BnOptimalAtePairing {
+//     fn line_function(a: &G2Affine, b: &G2Affine, p: &G1Affine) -> Fq12 {
+//         // Implement line function as described
+//         // Consider optimizations for isomorphism between E and E'
+//         unimplemented!()
+//     }
+//
+//     fn frobenius(q: &G2Affine) -> G2Affine {
+//         // Implement p-power Frobenius map
+//         unimplemented!()
+//     }
+//
+//     pub fn pairing(p: &G1Affine, q: &G2Affine) -> Fq12 {
+//         let t = Bn::x(); // BN parameter
+//         let c = 6 * t + 2;
+//
+//         let mut f = Fq12::one();
+//         let mut t_point = q.into_projective();
+//
+//         // Implement Miller loop
+//         for i in (0..c.bits()).rev() {
+//             f = f.square();
+//             f *= Self::line_function(&t_point.into_affine(), &t_point.into_affine(), p);
+//             t_point = t_point.double();
+//
+//             if c.bit(i) {
+//                 f *= Self::line_function(&t_point.into_affine(), q, p);
+//                 t_point += q;
+//             }
+//         }
+//
+//         // Final line functions
+//         let q1 = Self::frobenius(q);
+//         let q2 = Self::frobenius(&q1);
+//         f *= Self::line_function(&t_point.into_affine(), &q1, p);
+//         t_point += q1.into_projective();
+//         f *= Self::line_function(&t_point.into_affine(), &(-q2), p);
+//
+//         // Final exponentiation
+//         let p_k_minus_1_over_r = (Bn::final_exponent)();
+//         f.pow(p_k_minus_1_over_r.into_repr())
+//     }
+// }
