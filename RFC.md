@@ -272,7 +272,7 @@ The authentication signature message types (i3 = 4) is new. Since it uses compou
 
 ## 5. Alternatives Considered
 
-1. Fixed set of pre-generated keys
+1. Fixed set of pre-generated keys ("PB" protocol)
     - Pro: Public keys can be "baked in" to software without the need for Internet-based updates
     - Con: Lacks flexibility and still requires periodic updates, for various reasons, which must be done via requiring users to download a software update
 
