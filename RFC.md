@@ -207,16 +207,11 @@ The Cryptographically Secure Pseudorandom Number Generator (CSPRNG) is a corners
 
 2. Platform Compatibility: While the reference implementation is in Rust, the algorithm can be easily implemented in other languages.
 
-#### 3.4.5 Open Questions and Future Considerations
-1. Alternative Hash Functions: While BLAKE3 is chosen for its favorable properties, the impact of using more widely implemented alternatives like SHA-3 should be evaluated.
-2. State Size Adjustments: As SuperFox itself is somewhat experimental, the possibility of increasing the state size if future SuperFox message formats allow for more bits should be considered.
-
-
 ### 3.5 BLS Signature Considerations
 
 The choice of the elliptic curve for BLS signatures is crucial:
 
-1. Signature Size: BLS signatures typically have a size approximately twice the security level in bits. The prototype Rust code uses the BN254 curve to demonstrate the mechanics of the BTO protocol. The 256-bit signatures produced by this curve are slightly too large, however. We aim for a 200-bit signature to fit within the message constraints.
+1. Signature Size: BLS signatures typically have a size approximately twice the security level in bits. The prototype Rust code uses the BN254 curve to demonstrate the mechanics of the BTO protocol. The 256-bit signatures produced by this curve are slightly too large, however. We aim for a signature with a maximum size of 200-bit signature to fit within the message constraints.
 
 2. Security Level: The chosen curve should provide approximately 80-90 bits of security, balancing security requirements with signature/message size constraints.
 
@@ -233,23 +228,15 @@ This message type already exists in the prototype SuperFox protocol. It contains
 
 In the BTO protocol, we re-purpose these 20 bits to be a hash of the message data, callsign, timestamp, and the internal state of an RNG. Anyone with the hash inputs can recompute the hash & compare it to the transmitted 20-bit value. The RNG state is known only to the Fox at the time of transmission. Later, the Authentication Signature messages (described below) reveal RNG state bits that can be used to reconstruct the RNG state used in the Standard RRR message type & hence validate its authenticity.
 
-
-**Authentication Signature message w/ standard call (i3 = 4):** Contains standard 28-bit FoxCall, 15-bit grid locator, 56-bit RNG state, and approximately 185-bit BLS signature. The remaining ~45 bits are unused.
-```
-i3 = 4: Signed RNG State Message
------------------------------------------------------------------------------
-F   G   RN   D    U   M    Type
-c28 g15 rn56 d185 u45 i3=4 Auth Sig Standard
-28  43  99   284  329 
-```
-**Authentication Signature message w/ compound call (i3 = 5):** Contains a 58-bit compound FoxCall, 15-bit grid locator, 56-bit RNG state, and approximately 185-bit BLS signature. The remaining ~15 bits are unused.
+**Authentication Signature message w/ compound call (i3 = 4):** Contains a 58-bit compound FoxCall, 15-bit grid locator, 56-bit RNG state, and approximately 195-bit BLS signature. The exact signature size depends on the selection of the pairing curve, and must be no larger than 200 bits. When generating it, we'll try to make it as large as possible within the 200-bit limit (e.g. 195-bits), and leave whatever additional unused bits as empty. 
 ```
 i3 = 4: Signed RNG State Message
 -----------------------------------------------------------------------------
 FC  G   RN   D    U   M    Type
-c58 g15 rn56 d185 u15 i3=5 Auth Sig Compound
-58  73  129  314
+c58 g15 rn56 d195 u5 i3=5 Auth Sig Compound
+58  73  129  319
 ```
+Here, the signature is assumed to end up being 195-bits, leaving 5 bits unused.
 
 
 ```
@@ -267,7 +254,7 @@ T Free text, up to 26 characters total
 U Unused bits
 ```
 
-The two authentication signature message types (i3 = 4 and i3 = 5) are new. A compound callsign requires more bits than a standard one, so to ensure BTO supports both, the BLS signature size is chosen by assuming a compound callsign is used.
+The authentication signature message types (i3 = 4) is new. Since it uses compound callsigns, which allow encoding a superset of the standard callsign, only a single new message type is required.
 
 ### 3.7 Validation Process
 
@@ -286,7 +273,7 @@ The two authentication signature message types (i3 = 4 and i3 = 5) are new. A co
 ## 5. Alternatives Considered
 
 1. Fixed set of pre-generated keys
-    - Pro: Keys can be "baked in" to software without the need for Internet-based updates
+    - Pro: Public keys can be "baked in" to software without the need for Internet-based updates
     - Con: Lacks flexibility and still requires periodic updates, for various reasons, which must be done via requiring users to download a software update
 
 2. Per-message digital signatures
@@ -432,8 +419,9 @@ The BTO protocol requires efficient and secure distribution of DXpedition public
 #### 6.4.5 Security Considerations
 
 1. Root Key Protection:
-   - WSJT-X developer and NCDXF root keys must be kept extremely secure. We bake these keys into the WSJTX client software & they're used to sign DXpedition-specific keys. Anyone with access to these keys can thus create "authentic" DXpedition keypairs. As a matter of good hygeine, we should have an expiration of these keys & rotate them every ~2 years.
-   - In the basic scheme where we bake these in, a software update would be required to update them. We could consider delivering key updates via the GitHub repository, similar to DXpedition-specific keys.
+   - WSJT-X developer and NCDXF root private keys must be kept secure. Since we include the corresponding public keys in the WSJT-X client software by default, and they're used to sign DXpedition-specific keys, anyone with access to the private keys can thus create "official" DXpedition keypairs. Fortunately, in the BTO protocol, there is no need to share or otherwise transmit the private keys outside the WSJT-X/NCDXF group. 
+   - As a matter of good hygiene, we should have an expiration of these keys & rotate them every ~2 years.
+   - Besides relying on a software update to update the root keys, we could consider delivering key updates via the GitHub repository, similar to DXpedition-specific keys.
 
 2. DXpedition Key Security/Verification
    - We only require that DXpeditions send us their public key, which we sign with the WSJT-X developer and NCDXF root keys.
